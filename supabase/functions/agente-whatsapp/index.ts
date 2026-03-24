@@ -1,4 +1,4 @@
-// agente-whatsapp/index.ts — v3 con señal Stripe integrada
+// agente-whatsapp/index.ts — v4 con memoria de clientes
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 interface Mensaje {
@@ -16,6 +16,24 @@ interface RestauranteConfig {
   importe_senal_por_pax: number;
   mensaje_confirmacion: string;
   mensaje_completo: string;
+}
+
+interface ContextoCliente {
+  es_nuevo: boolean;
+  nombre?: string;
+  total_visitas?: number;
+  es_cliente_frecuente?: boolean;
+  es_cliente_vip?: boolean;
+  ultima_visita?: string;
+  alergias?: string[];
+  intolerancias?: string[];
+  preferencias?: string[];
+  necesidades_especiales?: string[];
+  ocasiones?: { tipo: string; fecha: string }[];
+  notas_personal?: string;
+  tasa_no_show?: number;
+  bloqueado?: boolean;
+  historial_reciente?: { fecha: string; personas: number; notas: string; estado: string }[];
 }
 
 function minutosAHora(min: number): string {
@@ -56,13 +74,57 @@ function fechaRelativaAISO(texto: string): string {
   return texto;
 }
 
-function buildSystemPrompt(restaurante: RestauranteConfig): string {
+// ── Construir contexto del cliente para el prompt ──
+function buildContextoClienteTexto(ctx: ContextoCliente): string {
+  if (ctx.es_nuevo) {
+    return "CONTEXTO DEL CLIENTE: Cliente nuevo, primera vez que contacta.";
+  }
+
+  const lineas: string[] = [];
+  lineas.push(`CONTEXTO DEL CLIENTE (usa esta info para personalizar la conversación):`);
+
+  if (ctx.es_cliente_vip) lineas.push(`⭐ Cliente VIP — ${ctx.total_visitas} visitas. Trato preferencial.`);
+  else if (ctx.es_cliente_frecuente) lineas.push(`🔄 Cliente frecuente — ${ctx.total_visitas} visitas.`);
+  else lineas.push(`Total visitas: ${ctx.total_visitas}`);
+
+  if (ctx.ultima_visita) lineas.push(`Última visita: ${ctx.ultima_visita}`);
+
+  if (ctx.alergias?.length) lineas.push(`⚠️ Alergias conocidas: ${ctx.alergias.join(", ")} — IMPORTANTE mencionarlo`);
+  if (ctx.intolerancias?.length) lineas.push(`⚠️ Intolerancias: ${ctx.intolerancias.join(", ")}`);
+  if (ctx.preferencias?.length) lineas.push(`Preferencias: ${ctx.preferencias.join(", ")}`);
+  if (ctx.necesidades_especiales?.length) lineas.push(`Necesidades especiales: ${ctx.necesidades_especiales.join(", ")}`);
+
+  if (ctx.ocasiones?.length) {
+    const hoy = new Date().toISOString().split("T")[0];
+    const ocasionHoy = ctx.ocasiones.find(o => o.fecha === hoy);
+    if (ocasionHoy) lineas.push(`🎉 HOY es su ${ocasionHoy.tipo} — considera ofrecerle un detalle de la casa`);
+  }
+
+  if (ctx.notas_personal) lineas.push(`Notas del equipo: ${ctx.notas_personal}`);
+
+  if (ctx.tasa_no_show && ctx.tasa_no_show > 30) {
+    lineas.push(`⚠️ Alta tasa de no-show (${ctx.tasa_no_show}%) — considera recordarle la reserva`);
+  }
+
+  if (ctx.historial_reciente?.length) {
+    const ultima = ctx.historial_reciente[0];
+    if (ultima.notas) lineas.push(`En su última visita anotó: "${ultima.notas}"`);
+  }
+
+  lineas.push(`INSTRUCCIÓN: Si el cliente ya ha visitado antes, salúdale por su nombre y hazle saber que le recuerdas. Si tiene alergias conocidas, pregúntale si siguen siendo las mismas en lugar de preguntar desde cero.`);
+
+  return lineas.join("\n");
+}
+
+function buildSystemPrompt(restaurante: RestauranteConfig, contextoCliente?: ContextoCliente): string {
   const serviciosTexto = restaurante.servicios
     .map(s => `${s.nombre}: ${minutosAHora(s.inicio)}-${minutosAHora(s.fin)}`)
     .join(", ");
   const hoy = new Date();
   const fechaHoy = hoy.toISOString().split("T")[0];
   const diaHoy = hoy.toLocaleDateString("es-ES", { weekday:"long", day:"numeric", month:"long" });
+
+  const contextoTexto = contextoCliente ? buildContextoClienteTexto(contextoCliente) : "";
 
   return `Eres el asistente virtual de ${restaurante.nombre}. Actúa como recepcionista amable y cercano, nunca robótico.
 
@@ -73,15 +135,18 @@ DATOS DEL RESTAURANTE:
 ${restaurante.cobrar_senal ? `- Señal requerida: ${restaurante.importe_senal_por_pax}€ por persona (se descuenta de la consumición)` : ""}
 - Hoy: ${diaHoy} (${fechaHoy})
 
+${contextoTexto}
+
 FLUJO DE RESERVA:
 1. Recoge: nombre, fecha, hora, personas.
-2. Pregunta siempre por alergias/intolerancias y necesidades especiales.
-3. Con todos los datos, confírmalos: "Solo para confirmar: Nombre: [X], Fecha: [X], Hora: [X], Personas: [X]. [Alergias]. ¿Todo correcto?"
-4. Cuando el cliente diga "sí", "perfecto", "confirmado" o similar, incluye EXACTAMENTE este bloque en tu respuesta:
+2. Si el cliente tiene alergias conocidas, pregunta si siguen siendo las mismas en lugar de preguntar desde cero.
+3. Si es cliente nuevo, pregunta siempre por alergias/intolerancias y necesidades especiales.
+4. Con todos los datos, confírmalos: "Solo para confirmar: Nombre: [X], Fecha: [X], Hora: [X], Personas: [X]. [Alergias]. ¿Todo correcto?"
+5. Cuando el cliente diga "sí", "perfecto", "confirmado" o similar, incluye EXACTAMENTE este bloque en tu respuesta:
 |||RESERVA|||{"restaurant_id":"${restaurante.id}","fecha":"YYYY-MM-DD","minutos_reserva":NNN,"personas":N,"nombre":"Nombre","telefono":"telefono","notas":"alergias y notas especiales"}|||FIN|||
    Después del bloque escribe tu mensaje de confirmación cálido.
-5. Si hay cambios, actualiza y pide nueva confirmación.
-${restaurante.cobrar_senal ? `6. IMPORTANTE: Este restaurante requiere señal de ${restaurante.importe_senal_por_pax}€/persona para confirmar la reserva. Cuando el sistema procese la reserva, recibirás un enlace de pago que debes enviar al cliente.` : ""}
+6. Si hay cambios, actualiza y pide nueva confirmación.
+${restaurante.cobrar_senal ? `7. IMPORTANTE: Este restaurante requiere señal de ${restaurante.importe_senal_por_pax}€/persona para confirmar la reserva.` : ""}
 
 CANCELACIONES:
 - Para buscar reserva: |||BUSCAR|||{"telefono":"tel","restaurant_id":"${restaurante.id}"}|||FIN|||
@@ -162,6 +227,87 @@ async function callGroq(systemPrompt: string, messages: Mensaje[]): Promise<stri
   return data.choices[0].message.content;
 }
 
+// ── Obtener contexto del cliente desde Supabase ──
+async function getContextoCliente(
+  supabase: ReturnType<typeof createClient>,
+  restaurant_id: string,
+  telefono: string
+): Promise<ContextoCliente> {
+  try {
+    const { data, error } = await supabase.rpc("get_contexto_cliente", {
+      p_restaurant_id: restaurant_id,
+      p_telefono: telefono,
+    });
+    if (error || !data) return { es_nuevo: true };
+    return data as ContextoCliente;
+  } catch {
+    return { es_nuevo: true };
+  }
+}
+
+// ── Actualizar perfil con datos nuevos detectados en conversación ──
+async function actualizarPerfilCliente(
+  supabase: ReturnType<typeof createClient>,
+  restaurant_id: string,
+  telefono: string,
+  updates: {
+    alergias?: string[];
+    intolerancias?: string[];
+    preferencias?: string[];
+    necesidades_especiales?: string[];
+    ocasion?: string;
+    fecha_ocasion?: string;
+  }
+) {
+  try {
+    const { data: cliente } = await supabase
+      .from("clientes")
+      .select("id, alergias, intolerancias, preferencias, necesidades_especiales, ocasiones")
+      .eq("restaurant_id", restaurant_id)
+      .eq("telefono", telefono)
+      .single();
+
+    if (!cliente) return;
+
+    const patchData: Record<string, unknown> = {};
+
+    if (updates.alergias?.length) {
+      const existentes = cliente.alergias ?? [];
+      const nuevas = updates.alergias.filter((a: string) => !existentes.includes(a));
+      if (nuevas.length) patchData.alergias = [...existentes, ...nuevas];
+    }
+
+    if (updates.intolerancias?.length) {
+      const existentes = cliente.intolerancias ?? [];
+      const nuevas = updates.intolerancias.filter((a: string) => !existentes.includes(a));
+      if (nuevas.length) patchData.intolerancias = [...existentes, ...nuevas];
+    }
+
+    if (updates.preferencias?.length) {
+      const existentes = cliente.preferencias ?? [];
+      const nuevas = updates.preferencias.filter((a: string) => !existentes.includes(a));
+      if (nuevas.length) patchData.preferencias = [...existentes, ...nuevas];
+    }
+
+    if (updates.necesidades_especiales?.length) {
+      const existentes = cliente.necesidades_especiales ?? [];
+      const nuevas = updates.necesidades_especiales.filter((a: string) => !existentes.includes(a));
+      if (nuevas.length) patchData.necesidades_especiales = [...existentes, ...nuevas];
+    }
+
+    if (updates.ocasion && updates.fecha_ocasion) {
+      const existentes = cliente.ocasiones ?? [];
+      patchData.ocasiones = [...existentes, { tipo: updates.ocasion, fecha: updates.fecha_ocasion }];
+    }
+
+    if (Object.keys(patchData).length > 0) {
+      await supabase.from("clientes").update(patchData).eq("id", cliente.id);
+    }
+  } catch (err) {
+    console.error("Error actualizando perfil:", err);
+  }
+}
+
 async function getConversacion(supabase: ReturnType<typeof createClient>, telefono: string, restaurant_id: string): Promise<Mensaje[]> {
   try {
     const { data } = await supabase.from("conversaciones").select("mensajes")
@@ -234,10 +380,20 @@ Deno.serve(async (req) => {
   if (!restData) return new Response(JSON.stringify({ ok: true }));
 
   const restaurante = restData as RestauranteConfig;
+
+  // ── Obtener contexto del cliente ──
+  const contextoCliente = await getContextoCliente(supabase, restaurant_id, telefono_cliente);
+
+  // Si el cliente está bloqueado, no responder
+  if (contextoCliente.bloqueado) {
+    return new Response(JSON.stringify({ ok: true }));
+  }
+
   const historial = await getConversacion(supabase, telefono_cliente, restaurant_id);
   const mensajes: Mensaje[] = [...historial, { role: "user", content: mensaje_cliente }];
 
-  const systemPrompt = buildSystemPrompt(restaurante);
+  // UNA SOLA llamada a Groq con contexto del cliente
+  const systemPrompt = buildSystemPrompt(restaurante, contextoCliente);
   const respuestaGroq = await callGroq(systemPrompt, mensajes);
   const { type, data, cleanText } = extractCommand(respuestaGroq);
 
@@ -275,8 +431,48 @@ Deno.serve(async (req) => {
       } else {
         const confirmacion = await callMotor({ ...data, minutos_reserva: disp.minutos_inicio ?? data.minutos_reserva, solo_consulta: false });
         if (confirmacion.status === "confirmada") {
+          // Actualizar perfil con datos nuevos de la conversación
+          if (data.notas) {
+            const notas = String(data.notas).toLowerCase();
+            const alergias: string[] = [];
+            const necesidades: string[] = [];
+
+            if (notas.includes("celiaco") || notas.includes("gluten")) alergias.push("celiaco");
+            if (notas.includes("marisco")) alergias.push("marisco");
+            if (notas.includes("lactosa")) alergias.push("lactosa");
+            if (notas.includes("silla alta")) necesidades.push("silla alta");
+            if (notas.includes("carrito")) necesidades.push("espacio carrito");
+            if (notas.includes("cumpleaños")) {
+              await actualizarPerfilCliente(supabase, restaurant_id, telefono_cliente, {
+                ocasion: "cumpleaños",
+                fecha_ocasion: String(data.fecha),
+              });
+            }
+            if (notas.includes("aniversario")) {
+              await actualizarPerfilCliente(supabase, restaurant_id, telefono_cliente, {
+                ocasion: "aniversario",
+                fecha_ocasion: String(data.fecha),
+              });
+            }
+
+            if (alergias.length || necesidades.length) {
+              await actualizarPerfilCliente(supabase, restaurant_id, telefono_cliente, {
+                alergias,
+                necesidades_especiales: necesidades,
+              });
+            }
+          }
+
           if (!cleanText || cleanText.length < 15) {
-            respuestaFinal = `¡Perfecto! Todo listo, ${data.nombre}. Te esperamos el ${data.fecha} a las ${disp.hora_inicio} para ${data.personas} persona${Number(data.personas) > 1 ? "s" : ""}. ${data.notas ? `Hemos anotado: ${data.notas}.` : ""} ¡Gracias!`;
+            const esVip = contextoCliente.es_cliente_vip;
+            const esFrecuente = contextoCliente.es_cliente_frecuente;
+            const saludo = esVip
+              ? `¡Perfecto! Un placer volver a tenerle, ${data.nombre}.`
+              : esFrecuente
+              ? `¡Perfecto! Como siempre, ${data.nombre}, encantados de recibirle.`
+              : `¡Perfecto! Todo listo, ${data.nombre}.`;
+
+            respuestaFinal = `${saludo} Te esperamos el ${data.fecha} a las ${disp.hora_inicio} para ${data.personas} persona${Number(data.personas) > 1 ? "s" : ""}. ${data.notas ? `Hemos anotado: ${data.notas}.` : ""} ¡Hasta pronto!`;
           }
         } else {
           respuestaFinal = "Ha ocurrido un problema al registrar la reserva. Por favor contacta directamente con el restaurante.";
