@@ -1,491 +1,320 @@
-// ============================================================
-// EDGE FUNCTION: motor-reservas
-// Reemplaza el blueprint de Make completo
-// URL: https://<proyecto>.supabase.co/functions/v1/motor-reservas
-// ============================================================
-
+// agente-whatsapp/index.ts — v3 con señal Stripe integrada
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-// ---------- Tipos ----------
-interface ReservaInput {
-  restaurant_id: string;
-  fecha: string;          // "YYYY-MM-DD"
-  minutos_reserva: number; // minutos desde medianoche: 840 = 14:00
-  personas: number;
-  nombre: string;
-  telefono?: string;
-  email?: string;
-  notas?: string;
-  origen?: string;        // 'whatsapp' | 'sms' | 'web' | 'presencial'
+interface Mensaje {
+  role: "user" | "assistant" | "system";
+  content: string;
 }
 
-interface Servicio {
-  nombre: string;
-  inicio: number;  // minutos desde medianoche
-  fin: number;
-}
-
-interface Restaurante {
+interface RestauranteConfig {
   id: string;
   nombre: string;
   aforo_maximo: number;
   duracion_minutos: number;
-  servicios: Servicio[];
-  calendario_google_id: string;
-  google_refresh_token: string;
+  servicios: { nombre: string; inicio: number; fin: number }[];
   cobrar_senal: boolean;
   importe_senal_por_pax: number;
   mensaje_confirmacion: string;
   mensaje_completo: string;
-  activo: boolean;
 }
 
-// ---------- Helpers ----------
-
-/**
- * Convierte minutos desde medianoche a string HH:MM
- */
-function minutosAHora(minutos: number): string {
-  const h = Math.floor(minutos / 60).toString().padStart(2, "0");
-  const m = (minutos % 60).toString().padStart(2, "0");
-  return `${h}:${m}`;
+function minutosAHora(min: number): string {
+  return String(Math.floor(min / 60)).padStart(2, "0") + ":" + String(min % 60).padStart(2, "0");
 }
 
-/**
- * Construye un datetime ISO a partir de fecha y minutos
- * Para Google Calendar
- */
-function fechaMinutosAISO(fecha: string, minutos: number): string {
-  const date = new Date(`${fecha}T00:00:00`);
-  date.setMinutes(date.getMinutes() + minutos);
-  return date.toISOString();
+function horaAMinutos(hora: string): number {
+  const limpia = hora.trim().replace(/[hH]s?\.?\s*/g, ":").replace(/\s/g, "");
+  const [h, m] = limpia.split(":").map(Number);
+  return (h || 0) * 60 + (m || 0);
 }
 
-/**
- * Detecta en qué servicio cae la hora solicitada
- */
-function detectarServicio(
-  minutosReserva: number,
-  servicios: Servicio[]
-): Servicio | null {
-  return (
-    servicios.find(
-      (s) => minutosReserva >= s.inicio && minutosReserva < s.fin
-    ) ?? null
-  );
-}
-
-/**
- * Suma personas de reservas confirmadas en un rango de tiempo
- * Lógica idéntica al filtro de Make:
- *   minutos_inicio < minutos_fin_nueva  AND  minutos_fin > minutos_inicio_nueva
- */
-async function contarPersonasEnFranja(
-  supabase: ReturnType<typeof createClient>,
-  restaurant_id: string,
-  fecha: string,
-  minutos_inicio: number,
-  minutos_fin: number
-): Promise<number> {
-  const { data, error } = await supabase
-    .from("reservas")
-    .select("personas")
-    .eq("restaurant_id", restaurant_id)
-    .eq("fecha", fecha)
-    .eq("estado", "confirmada")
-    .lt("minutos_inicio", minutos_fin)    // empieza antes del fin del nuevo
-    .gt("minutos_fin", minutos_inicio);   // termina después del inicio del nuevo
-
-  if (error) throw new Error(`Error consultando reservas: ${error.message}`);
-
-  return (data ?? []).reduce((acc, r) => acc + (r.personas ?? 0), 0);
-}
-
-/**
- * Crea evento en Google Calendar usando la API REST
- * Usa el refresh token del restaurante para obtener access token
- */
-async function crearEventoCalendar(
-  refreshToken: string,
-  calendarId: string,
-  summary: string,
-  description: string,
-  fechaInicio: string,
-  fechaFin: string
-): Promise<string | null> {
-  try {
-    // 1. Obtener access token con refresh token
-    const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_id: Deno.env.get("GOOGLE_CLIENT_ID") ?? "",
-        client_secret: Deno.env.get("GOOGLE_CLIENT_SECRET") ?? "",
-        refresh_token: refreshToken,
-        grant_type: "refresh_token",
-      }),
-    });
-
-    const tokenData = await tokenRes.json();
-    if (!tokenData.access_token) {
-      console.error("Error obteniendo access token Google:", tokenData);
-      return null;
-    }
-
-    // 2. Crear evento
-    const eventRes = await fetch(
-      `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${tokenData.access_token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          summary,
-          description,
-          start: { dateTime: fechaInicio, timeZone: "Europe/Madrid" },
-          end: { dateTime: fechaFin, timeZone: "Europe/Madrid" },
-          reminders: {
-            useDefault: false,
-            overrides: [{ method: "email", minutes: 60 }],
-          },
-        }),
-      }
-    );
-
-    const eventData = await eventRes.json();
-    return eventData.id ?? null;
-  } catch (err) {
-    console.error("Error creando evento Calendar:", err);
-    return null;
+function fechaRelativaAISO(texto: string): string {
+  const hoy = new Date();
+  const lower = texto.toLowerCase().trim();
+  if (lower === "hoy") return hoy.toISOString().split("T")[0];
+  if (lower === "mañana") {
+    const d = new Date(hoy); d.setDate(hoy.getDate() + 1);
+    return d.toISOString().split("T")[0];
   }
+  const dias: Record<string, number> = {
+    lunes:1, martes:2, "miércoles":3, miercoles:3,
+    jueves:4, viernes:5, "sábado":6, sabado:6, domingo:0
+  };
+  for (const [dia, num] of Object.entries(dias)) {
+    if (lower.includes(dia)) {
+      let diff = num - hoy.getDay();
+      if (diff <= 0) diff += 7;
+      const d = new Date(hoy); d.setDate(hoy.getDate() + diff);
+      return d.toISOString().split("T")[0];
+    }
+  }
+  const match = texto.match(/(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?/);
+  if (match) {
+    const anio = match[3] ? (match[3].length === 2 ? `20${match[3]}` : match[3]) : hoy.getFullYear().toString();
+    return `${anio}-${match[2].padStart(2,"0")}-${match[1].padStart(2,"0")}`;
+  }
+  return texto;
 }
 
-/**
- * Guarda la reserva en Supabase
- */
-async function guardarReserva(
-  supabase: ReturnType<typeof createClient>,
-  input: ReservaInput,
-  minutos_inicio: number,
-  minutos_fin: number,
-  tipo_turno: string,
-  nombre_servicio: string,
-  google_event_id: string | null,
-  restaurante: Restaurante
-) {
-  const { error } = await supabase.from("reservas").insert({
-    restaurant_id: input.restaurant_id,
-    nombre: input.nombre,
-    telefono: input.telefono ?? null,
-    email: input.email ?? null,
-    personas: input.personas,
-    notas: input.notas ?? null,
-    fecha: input.fecha,
-    minutos_inicio,
-    minutos_fin,
-    tipo_turno,
-    nombre_servicio,
-    google_event_id,
-    estado: "confirmada",
-    senal_requerida: restaurante.cobrar_senal,
-    senal_importe: restaurante.cobrar_senal
-      ? restaurante.importe_senal_por_pax * input.personas
-      : 0,
-    origen: input.origen ?? "web",
+function buildSystemPrompt(restaurante: RestauranteConfig): string {
+  const serviciosTexto = restaurante.servicios
+    .map(s => `${s.nombre}: ${minutosAHora(s.inicio)}-${minutosAHora(s.fin)}`)
+    .join(", ");
+  const hoy = new Date();
+  const fechaHoy = hoy.toISOString().split("T")[0];
+  const diaHoy = hoy.toLocaleDateString("es-ES", { weekday:"long", day:"numeric", month:"long" });
+
+  return `Eres el asistente virtual de ${restaurante.nombre}. Actúa como recepcionista amable y cercano, nunca robótico.
+
+DATOS DEL RESTAURANTE:
+- Horarios: ${serviciosTexto}
+- Aforo máximo: ${restaurante.aforo_maximo} personas
+- Duración media: ${restaurante.duracion_minutos} minutos
+${restaurante.cobrar_senal ? `- Señal requerida: ${restaurante.importe_senal_por_pax}€ por persona (se descuenta de la consumición)` : ""}
+- Hoy: ${diaHoy} (${fechaHoy})
+
+FLUJO DE RESERVA:
+1. Recoge: nombre, fecha, hora, personas.
+2. Pregunta siempre por alergias/intolerancias y necesidades especiales.
+3. Con todos los datos, confírmalos: "Solo para confirmar: Nombre: [X], Fecha: [X], Hora: [X], Personas: [X]. [Alergias]. ¿Todo correcto?"
+4. Cuando el cliente diga "sí", "perfecto", "confirmado" o similar, incluye EXACTAMENTE este bloque en tu respuesta:
+|||RESERVA|||{"restaurant_id":"${restaurante.id}","fecha":"YYYY-MM-DD","minutos_reserva":NNN,"personas":N,"nombre":"Nombre","telefono":"telefono","notas":"alergias y notas especiales"}|||FIN|||
+   Después del bloque escribe tu mensaje de confirmación cálido.
+5. Si hay cambios, actualiza y pide nueva confirmación.
+${restaurante.cobrar_senal ? `6. IMPORTANTE: Este restaurante requiere señal de ${restaurante.importe_senal_por_pax}€/persona para confirmar la reserva. Cuando el sistema procese la reserva, recibirás un enlace de pago que debes enviar al cliente.` : ""}
+
+CANCELACIONES:
+- Para buscar reserva: |||BUSCAR|||{"telefono":"tel","restaurant_id":"${restaurante.id}"}|||FIN|||
+- Para cancelar: |||CANCELAR|||{"reserva_id":"id","restaurant_id":"${restaurante.id}"}|||FIN|||
+
+REGLAS IMPORTANTES:
+- NUNCA pongas el bloque JSON sin confirmación explícita del cliente
+- El bloque JSON es invisible para el cliente, el sistema lo procesa automáticamente
+- Tono siempre cálido y breve
+- minutos_reserva: 840=14:00, 1200=20:00, 1260=21:00, 1230=20:30
+- fecha siempre en formato YYYY-MM-DD`;
+}
+
+function extractCommand(text: string): {
+  type: "RESERVA" | "BUSCAR" | "CANCELAR" | null;
+  data: Record<string, unknown>;
+  cleanText: string;
+} {
+  const pattern = /\|\|\|(\w+)\|\|\|([\s\S]*?)\|\|\|FIN\|\|\|/;
+  const match = text.match(pattern);
+  if (!match) return { type: null, data: {}, cleanText: text };
+
+  const type = match[1] as "RESERVA" | "BUSCAR" | "CANCELAR";
+  let data: Record<string, unknown> = {};
+  try { data = JSON.parse(match[2].trim()); }
+  catch { console.error("JSON parse error:", match[2]); }
+
+  const cleanText = text.replace(pattern, "").replace(/\n\n+/, "\n").trim();
+  return { type, data, cleanText };
+}
+
+async function callMotor(body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const res = await fetch(`${Deno.env.get("SUPABASE_URL")}/functions/v1/motor-reservas`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}` },
+    body: JSON.stringify(body),
   });
-
-  if (error) throw new Error(`Error guardando reserva: ${error.message}`);
+  return res.json();
 }
 
-// ============================================================
-// HANDLER PRINCIPAL
-// ============================================================
-Deno.serve(async (req) => {
-  // CORS para llamadas desde web widget
-  if (req.method === "OPTIONS") {
-    return new Response(null, {
-      headers: {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      },
-    });
-  }
+async function callGestionar(body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const res = await fetch(`${Deno.env.get("SUPABASE_URL")}/functions/v1/gestionar-reserva`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}` },
+    body: JSON.stringify(body),
+  });
+  return res.json();
+}
 
-  if (req.method !== "POST") {
-    return new Response(JSON.stringify({ error: "Método no permitido" }), {
-      status: 405,
-    });
-  }
+async function callCrearSesionPago(body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const res = await fetch(`${Deno.env.get("SUPABASE_URL")}/functions/v1/crear-sesion-pago`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}` },
+    body: JSON.stringify(body),
+  });
+  return res.json();
+}
 
-  const supabase = createClient(
-    Deno.env.get("SUPABASE_URL") ?? "",
-    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
+async function callGroq(systemPrompt: string, messages: Mensaje[]): Promise<string> {
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${Deno.env.get("GROQ_API_KEY")}` },
+    body: JSON.stringify({
+      model: "llama-3.3-70b-versatile",
+      messages: [
+        { role: "system", content: systemPrompt },
+        ...messages.map(m => ({ role: m.role, content: m.content })),
+      ],
+      max_tokens: 500,
+      temperature: 0.7,
+    }),
+  });
+  const data = await res.json();
+  if (!data.choices?.[0]?.message?.content) {
+    console.error("Error Groq:", JSON.stringify(data));
+    return "Lo siento, ha ocurrido un error. Por favor inténtalo de nuevo.";
+  }
+  return data.choices[0].message.content;
+}
+
+async function getConversacion(supabase: ReturnType<typeof createClient>, telefono: string, restaurant_id: string): Promise<Mensaje[]> {
+  try {
+    const { data } = await supabase.from("conversaciones").select("mensajes")
+      .eq("telefono", telefono).eq("restaurant_id", restaurant_id)
+      .gte("updated_at", new Date(Date.now() - 30 * 60 * 1000).toISOString()).single();
+    return data?.mensajes ?? [];
+  } catch { return []; }
+}
+
+async function saveConversacion(supabase: ReturnType<typeof createClient>, telefono: string, restaurant_id: string, mensajes: Mensaje[]) {
+  await supabase.from("conversaciones").upsert(
+    { telefono, restaurant_id, mensajes: mensajes.slice(-20), updated_at: new Date().toISOString() },
+    { onConflict: "telefono,restaurant_id" }
   );
+}
 
-  let input: ReservaInput;
-  try {
-    input = await req.json();
-  } catch {
-    return new Response(
-      JSON.stringify({ status: "error", mensaje: "JSON inválido" }),
-      { status: 400 }
-    );
+async function sendWhatsApp(to: string, message: string, phoneNumberId: string) {
+  await fetch(`https://graph.facebook.com/v19.0/${phoneNumberId}/messages`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${Deno.env.get("WHATSAPP_TOKEN")}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ messaging_product: "whatsapp", to, type: "text", text: { body: message } }),
+  });
+}
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type, Authorization" } });
   }
 
-  // Validación básica
-  const required = ["restaurant_id", "fecha", "minutos_reserva", "personas", "nombre"];
-  for (const campo of required) {
-    if (!input[campo as keyof ReservaInput]) {
-      return new Response(
-        JSON.stringify({ status: "error", mensaje: `Falta campo: ${campo}` }),
-        { status: 400 }
-      );
+  if (req.method === "GET") {
+    const url = new URL(req.url);
+    if (url.searchParams.get("hub.mode") === "subscribe" && url.searchParams.get("hub.verify_token") === Deno.env.get("WHATSAPP_VERIFY_TOKEN")) {
+      return new Response(url.searchParams.get("hub.challenge"), { status: 200 });
     }
+    return new Response("Forbidden", { status: 403 });
   }
 
-  try {
-    // ── PASO 1: Cargar configuración del restaurante ──
-    const { data: restData, error: restError } = await supabase
-      .from("restaurantes")
-      .select("*")
-      .eq("id", input.restaurant_id)
-      .eq("activo", true)
-      .single();
+  const supabase = createClient(Deno.env.get("SUPABASE_URL") ?? "", Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "");
 
-    if (restError || !restData) {
-      return new Response(
-        JSON.stringify({
-          status: "error",
-          mensaje: "Restaurante no encontrado o inactivo",
-        }),
-        { status: 404 }
-      );
-    }
+  let body: Record<string, unknown>;
+  try { body = await req.json(); }
+  catch { return new Response("Bad request", { status: 400 }); }
 
-    const restaurante = restData as Restaurante;
+  let mensaje_cliente = "", telefono_cliente = "", canal = "web", phone_number_id = "", restaurant_id = "";
 
-    // ── PASO 2: Comprobar día cerrado ──
-    const { data: diaCerrado } = await supabase
-      .from("dias_cerrados")
-      .select("id, motivo, servicios_cerrados, todo_el_dia")
-      .eq("restaurant_id", input.restaurant_id)
-      .eq("fecha", input.fecha)
-      .single();
+  const waEntry = (body?.entry as unknown[])?.[0] as Record<string, unknown>;
+  const waChanges = (waEntry?.changes as unknown[])?.[0] as Record<string, unknown>;
+  const waValue = waChanges?.value as Record<string, unknown>;
+  const waMessage = (waValue?.messages as unknown[])?.[0] as Record<string, unknown>;
 
-    if (diaCerrado) {
-      // Detectar qué servicio es la hora solicitada
-      const servicioSolicitado = detectarServicio(
-        input.minutos_reserva,
-        restaurante.servicios
-      );
-      const esTodoElDia = diaCerrado.todo_el_dia;
-      const serviciosCerrados: string[] = diaCerrado.servicios_cerrados ?? [];
+  if (waMessage && waValue) {
+    mensaje_cliente = (waMessage.text as { body?: string })?.body ?? "";
+    telefono_cliente = "+" + String(waMessage.from ?? "");
+    canal = "whatsapp";
+    phone_number_id = String(waValue.phone_number_id ?? "");
+    const { data: rest } = await supabase.from("restaurantes").select("id").eq("whatsapp_phone_id", phone_number_id).single();
+    restaurant_id = rest?.id ?? Deno.env.get("DEFAULT_RESTAURANT_ID") ?? "";
+  }
 
-      const estaCerrado =
-        esTodoElDia ||
-        (servicioSolicitado &&
-          serviciosCerrados.includes(servicioSolicitado.nombre));
+  if (!mensaje_cliente && body.mensaje) {
+    mensaje_cliente = String(body.mensaje ?? "");
+    telefono_cliente = String(body.telefono ?? "web-user");
+    canal = String(body.canal ?? "web");
+    restaurant_id = String(body.restaurant_id ?? "");
+  }
 
-      if (estaCerrado) {
-        return new Response(
-          JSON.stringify({
-            status: "cerrado",
-            mensaje: `El restaurante está cerrado ese día. ${
-              diaCerrado.motivo ? `Motivo: ${diaCerrado.motivo}` : ""
-            }`.trim(),
-          }),
-          { status: 200 }
-        );
+  if (!mensaje_cliente || !restaurant_id) return new Response(JSON.stringify({ ok: true }));
+
+  const { data: restData } = await supabase.from("restaurantes").select("*").eq("id", restaurant_id).eq("activo", true).single();
+  if (!restData) return new Response(JSON.stringify({ ok: true }));
+
+  const restaurante = restData as RestauranteConfig;
+  const historial = await getConversacion(supabase, telefono_cliente, restaurant_id);
+  const mensajes: Mensaje[] = [...historial, { role: "user", content: mensaje_cliente }];
+
+  const systemPrompt = buildSystemPrompt(restaurante);
+  const respuestaGroq = await callGroq(systemPrompt, mensajes);
+  const { type, data, cleanText } = extractCommand(respuestaGroq);
+
+  let respuestaFinal = cleanText;
+
+  if (type === "RESERVA" && data.fecha && data.minutos_reserva !== undefined && data.personas && data.nombre) {
+    if (typeof data.fecha === "string" && !data.fecha.match(/^\d{4}-/)) data.fecha = fechaRelativaAISO(data.fecha);
+    if (typeof data.minutos_reserva === "string") data.minutos_reserva = horaAMinutos(data.minutos_reserva as string);
+    if (!data.telefono) data.telefono = telefono_cliente;
+    if (!data.origen) data.origen = canal;
+
+    const disp = await callMotor({ ...data, solo_consulta: true });
+
+    if (disp.status === "disponible") {
+      if (restaurante.cobrar_senal) {
+        const sesionPago = await callCrearSesionPago({
+          restaurant_id: data.restaurant_id,
+          fecha: data.fecha,
+          minutos_inicio: disp.minutos_inicio,
+          minutos_fin: disp.minutos_fin,
+          personas: data.personas,
+          nombre: data.nombre,
+          telefono: data.telefono,
+          notas: data.notas ?? "",
+          origen: data.origen,
+        });
+
+        if (sesionPago.url_pago) {
+          const importe = sesionPago.importe as number;
+          const hora = disp.hora_inicio as string;
+          respuestaFinal = `¡Genial! Tenemos disponibilidad el ${data.fecha} a las ${hora} para ${data.personas} persona${Number(data.personas) > 1 ? "s" : ""}.\n\nPara confirmar tu reserva necesitamos una señal de ${importe.toFixed(2)}€ (${restaurante.importe_senal_por_pax}€/persona) que se descontará de tu consumición.\n\nCompleta el pago aquí 👇\n${sesionPago.url_pago}\n\nTienes 30 minutos. ¡Te esperamos!`;
+        } else {
+          respuestaFinal = "Ha ocurrido un problema al procesar el pago. Por favor contacta directamente con el restaurante.";
+        }
+      } else {
+        const confirmacion = await callMotor({ ...data, minutos_reserva: disp.minutos_inicio ?? data.minutos_reserva, solo_consulta: false });
+        if (confirmacion.status === "confirmada") {
+          if (!cleanText || cleanText.length < 15) {
+            respuestaFinal = `¡Perfecto! Todo listo, ${data.nombre}. Te esperamos el ${data.fecha} a las ${disp.hora_inicio} para ${data.personas} persona${Number(data.personas) > 1 ? "s" : ""}. ${data.notas ? `Hemos anotado: ${data.notas}.` : ""} ¡Gracias!`;
+          }
+        } else {
+          respuestaFinal = "Ha ocurrido un problema al registrar la reserva. Por favor contacta directamente con el restaurante.";
+        }
       }
+    } else if (disp.status === "completo") {
+      respuestaFinal = `Lo siento, el servicio está completo para esa hora. ${restaurante.mensaje_completo}`;
+    } else {
+      respuestaFinal = String(disp.mensaje ?? restaurante.mensaje_completo);
     }
 
-    // ── PASO 3: Detectar servicio y calcular franjas ──
-    const servicio = detectarServicio(
-      input.minutos_reserva,
-      restaurante.servicios
-    );
-
-    if (!servicio) {
-      return new Response(
-        JSON.stringify({
-          status: "fuera_horario",
-          mensaje: "La hora solicitada está fuera del horario de servicio.",
-        }),
-        { status: 200 }
-      );
+  } else if (type === "BUSCAR") {
+    const res = await callGestionar({ ...data, accion: "buscar" });
+    if (res.status === "encontrada") {
+      const lista = (res.reservas as { fecha: string; hora: string; personas: number; servicio: string; id: string }[])
+        .map(r => `• ${r.fecha} a las ${r.hora} — ${r.personas} personas (${r.servicio || ""})`).join("\n");
+      respuestaFinal = `Encontré estas reservas:\n${lista}\n¿Cuál deseas cancelar?`;
+    } else {
+      respuestaFinal = "No encuentro reservas activas con ese número de teléfono.";
     }
 
-    // Igual que Make: todo en minutos
-    const minutos_inicio_primer_turno = input.minutos_reserva;
-    const minutos_fin_primer_turno =
-      input.minutos_reserva + restaurante.duracion_minutos;
-
-    // ── PASO 4: Contar personas en el primer turno ──
-    const personasExistentes = await contarPersonasEnFranja(
-      supabase,
-      input.restaurant_id,
-      input.fecha,
-      minutos_inicio_primer_turno,
-      minutos_fin_primer_turno
-    );
-
-    const hayAforo =
-      personasExistentes + input.personas <= restaurante.aforo_maximo;
-
-    // ── PASO 5A: HAY AFORO → confirmar primer turno ──
-    if (hayAforo) {
-      const horaInicio = minutosAHora(minutos_inicio_primer_turno);
-      const horaFin = minutosAHora(minutos_fin_primer_turno);
-
-      const summary = `Reserva – ${input.nombre} – ${input.personas} pax`;
-      const description = [
-        `Nombre: ${input.nombre}`,
-        `Teléfono: ${input.telefono ?? "-"}`,
-        `Personas: ${input.personas}`,
-        `Notas: ${input.notas ?? "-"}`,
-        `Origen: ${input.origen ?? "web"}`,
-      ].join("\n");
-
-      const eventId = await crearEventoCalendar(
-        restaurante.google_refresh_token,
-        restaurante.calendario_google_id,
-        summary,
-        description,
-        fechaMinutosAISO(input.fecha, minutos_inicio_primer_turno),
-        fechaMinutosAISO(input.fecha, minutos_fin_primer_turno)
-      );
-
-      await guardarReserva(
-        supabase,
-        input,
-        minutos_inicio_primer_turno,
-        minutos_fin_primer_turno,
-        "primero",
-        servicio.nombre,
-        eventId,
-        restaurante
-      );
-
-      return new Response(
-        JSON.stringify({
-          status: "confirmada",
-          turno: "primero",
-          hora_inicio: horaInicio,
-          hora_fin: horaFin,
-          servicio: servicio.nombre,
-          mensaje: restaurante.mensaje_confirmacion,
-          senal_requerida: restaurante.cobrar_senal,
-          senal_importe: restaurante.cobrar_senal
-            ? restaurante.importe_senal_por_pax * input.personas
-            : 0,
-        }),
-        { status: 200 }
-      );
-    }
-
-    // ── PASO 5B: NO HAY AFORO → intentar doblar mesa ──
-    // El segundo turno empieza cuando termina el primero
-    const minutos_inicio_segundo_turno = minutos_fin_primer_turno;
-    const minutos_fin_segundo_turno =
-      minutos_inicio_segundo_turno + restaurante.duracion_minutos;
-
-    // Verificar que el segundo turno cabe dentro del horario del servicio
-    const segundoTurnoDentroDeHorario =
-      minutos_fin_segundo_turno <= servicio.fin;
-
-    if (!segundoTurnoDentroDeHorario) {
-      // No hay posibilidad ni de doblar: servicio completo
-      return new Response(
-        JSON.stringify({
-          status: "completo",
-          mensaje: restaurante.mensaje_completo,
-        }),
-        { status: 200 }
-      );
-    }
-
-    // Contar personas en el segundo turno
-    const personasSegundoTurno = await contarPersonasEnFranja(
-      supabase,
-      input.restaurant_id,
-      input.fecha,
-      minutos_inicio_segundo_turno,
-      minutos_fin_segundo_turno
-    );
-
-    const hayAforoSegundoTurno =
-      personasSegundoTurno + input.personas <= restaurante.aforo_maximo;
-
-    if (!hayAforoSegundoTurno) {
-      return new Response(
-        JSON.stringify({
-          status: "completo",
-          mensaje: restaurante.mensaje_completo,
-        }),
-        { status: 200 }
-      );
-    }
-
-    // ── PASO 6: Confirmar SEGUNDO turno (doblar mesa) ──
-    const horaInicioSegundo = minutosAHora(minutos_inicio_segundo_turno);
-    const horaFinSegundo = minutosAHora(minutos_fin_segundo_turno);
-
-    const summarySegundo = `Reserva – ${input.nombre} – ${input.personas} pax`;
-    const descSegundo = [
-      `Nombre: ${input.nombre}`,
-      `Teléfono: ${input.telefono ?? "-"}`,
-      `Personas: ${input.personas}`,
-      `Notas: ${input.notas ?? "-"}`,
-      `Turno: segundo turno (mesa doblada)`,
-      `Origen: ${input.origen ?? "web"}`,
-    ].join("\n");
-
-    const eventIdSegundo = await crearEventoCalendar(
-      restaurante.google_refresh_token,
-      restaurante.calendario_google_id,
-      summarySegundo,
-      descSegundo,
-      fechaMinutosAISO(input.fecha, minutos_inicio_segundo_turno),
-      fechaMinutosAISO(input.fecha, minutos_fin_segundo_turno)
-    );
-
-    await guardarReserva(
-      supabase,
-      input,
-      minutos_inicio_segundo_turno,
-      minutos_fin_segundo_turno,
-      "segundo",
-      servicio.nombre,
-      eventIdSegundo,
-      restaurante
-    );
-
-    return new Response(
-      JSON.stringify({
-        status: "confirmada",
-        turno: "segundo",
-        hora_inicio: horaInicioSegundo,
-        hora_fin: horaFinSegundo,
-        servicio: servicio.nombre,
-        mensaje: `Su primera opción estaba completa. Le hemos reservado mesa a las ${horaInicioSegundo}. ${restaurante.mensaje_confirmacion}`,
-        senal_requerida: restaurante.cobrar_senal,
-        senal_importe: restaurante.cobrar_senal
-          ? restaurante.importe_senal_por_pax * input.personas
-          : 0,
-      }),
-      { status: 200 }
-    );
-  } catch (err) {
-    console.error("Error en motor-reservas:", err);
-    return new Response(
-      JSON.stringify({
-        status: "error",
-        mensaje: "Error interno del servidor",
-      }),
-      { status: 500 }
-    );
+  } else if (type === "CANCELAR") {
+    const res = await callGestionar({ ...data, accion: "cancelar" });
+    respuestaFinal = res.status === "cancelada"
+      ? "Tu reserva ha sido cancelada correctamente. ¡Esperamos verte pronto!"
+      : "No pude cancelar la reserva. Por favor contacta directamente con el restaurante.";
   }
+
+  mensajes.push({ role: "assistant", content: respuestaFinal });
+  await saveConversacion(supabase, telefono_cliente, restaurant_id, mensajes);
+
+  if (canal === "whatsapp" && phone_number_id) {
+    await sendWhatsApp(telefono_cliente, respuestaFinal, phone_number_id);
+    return new Response(JSON.stringify({ ok: true }));
+  }
+
+  return new Response(
+    JSON.stringify({ respuesta: respuestaFinal }),
+    { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }
+  );
 });
